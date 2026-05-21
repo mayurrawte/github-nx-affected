@@ -1,0 +1,182 @@
+name: 'Nx Affected'
+description: 'Detect affected Nx projects in monorepos and output matrix-ready JSON arrays for fan-out builds, tests, and deploys.'
+author: 'Mayur Rawte'
+branding:
+  icon: 'git-branch'
+  color: 'blue'
+
+inputs:
+  target:
+    description: 'Nx target to filter affected projects by (e.g. build, test, deploy, lint). Empty = all affected projects regardless of target.'
+    required: false
+    default: ''
+  base:
+    description: 'Base SHA/ref for comparison. If empty: PRs use pull_request.base.sha; pushes use event.before; falls back to HEAD~1.'
+    required: false
+    default: ''
+  head:
+    description: 'Head SHA/ref for comparison.'
+    required: false
+    default: 'HEAD'
+  node-version:
+    description: 'Node.js version'
+    required: false
+    default: '22'
+  package-manager:
+    description: 'Package manager: npm, yarn, or pnpm. Auto-detects from lockfile if empty.'
+    required: false
+    default: ''
+  working-directory:
+    description: 'Directory containing the Nx workspace (where nx.json lives).'
+    required: false
+    default: '.'
+  install:
+    description: 'Run package install before computing affected. Set false if dependencies are already installed.'
+    required: false
+    default: 'true'
+  auto-deepen:
+    description: 'Automatically deepen git history if the base SHA is unreachable (shallow clone fix).'
+    required: false
+    default: 'true'
+
+outputs:
+  affected:
+    description: 'JSON array of all affected project names (apps + libs)'
+    value: ${{ steps.affected.outputs.all }}
+  affected-apps:
+    description: 'JSON array of affected app names — paste directly into strategy.matrix'
+    value: ${{ steps.affected.outputs.apps }}
+  affected-libs:
+    description: 'JSON array of affected library names'
+    value: ${{ steps.affected.outputs.libs }}
+  has-affected:
+    description: 'true if any project is affected, false otherwise. Use in step-level if: conditions.'
+    value: ${{ steps.affected.outputs.has-affected }}
+  count:
+    description: 'Number of affected projects'
+    value: ${{ steps.affected.outputs.count }}
+  base-sha:
+    description: 'The resolved base SHA used for comparison'
+    value: ${{ steps.base.outputs.base }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect package manager
+      id: pm
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -n "${{ inputs.package-manager }}" ]; then
+          PM="${{ inputs.package-manager }}"
+        elif [ -f "pnpm-lock.yaml" ]; then
+          PM="pnpm"
+        elif [ -f "yarn.lock" ]; then
+          PM="yarn"
+        else
+          PM="npm"
+        fi
+        echo "pm=$PM" >> "$GITHUB_OUTPUT"
+        echo "Detected package manager: $PM"
+
+    - name: Setup pnpm
+      if: ${{ steps.pm.outputs.pm == 'pnpm' }}
+      uses: pnpm/action-setup@v4
+      with:
+        version: latest
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ steps.pm.outputs.pm }}
+        cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.pm.outputs.pm == 'pnpm' && 'pnpm-lock.yaml' || steps.pm.outputs.pm == 'yarn' && 'yarn.lock' || 'package-lock.json' }}
+
+    - name: Install dependencies
+      if: ${{ inputs.install == 'true' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        case "${{ steps.pm.outputs.pm }}" in
+          npm)  npm ci ;;
+          yarn) yarn install --frozen-lockfile ;;
+          pnpm) pnpm install --frozen-lockfile ;;
+        esac
+
+    - name: Resolve base SHA
+      id: base
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.base }}" ]; then
+          BASE="${{ inputs.base }}"
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+          BASE="${{ github.event.before }}"
+        else
+          BASE="HEAD~1"
+        fi
+        echo "base=$BASE" >> "$GITHUB_OUTPUT"
+        echo "Base SHA: $BASE"
+
+    - name: Ensure base SHA is reachable
+      if: ${{ inputs.auto-deepen == 'true' }}
+      shell: bash
+      env:
+        BASE: ${{ steps.base.outputs.base }}
+      run: |
+        if [ "$BASE" = "HEAD~1" ]; then
+          if ! git rev-parse "$BASE" >/dev/null 2>&1; then
+            echo "::warning::HEAD~1 not reachable in shallow clone — deepening history."
+            git fetch --deepen=50 || git fetch --unshallow || true
+          fi
+        elif ! git cat-file -e "$BASE" 2>/dev/null; then
+          echo "::warning::Base SHA $BASE is not in the local repo. Deepening clone — consider using actions/checkout@v4 with fetch-depth: 0."
+          git fetch --unshallow 2>/dev/null || git fetch origin "$BASE" || git fetch --deepen=50 || true
+        fi
+
+    - name: Compute affected projects
+      id: affected
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE: ${{ steps.base.outputs.base }}
+        HEAD: ${{ inputs.head }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        BASE_ARGS="--base=$BASE --head=$HEAD"
+        TARGET_ARGS=""
+        if [ -n "$TARGET" ]; then TARGET_ARGS="--with-target=$TARGET"; fi
+
+        APPS=$(npx --no-install nx show projects --affected $BASE_ARGS --type=app --json $TARGET_ARGS 2>/dev/null || echo "[]")
+        LIBS=$(npx --no-install nx show projects --affected $BASE_ARGS --type=lib --json $TARGET_ARGS 2>/dev/null || echo "[]")
+        ALL=$(npx --no-install nx show projects --affected $BASE_ARGS --json $TARGET_ARGS 2>/dev/null || echo "[]")
+
+        # Normalize: nx returns newline-separated lines in --json mode if it errors.
+        # Use node to validate JSON and recover, falling back to [].
+        clean_json() {
+          node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const a=JSON.parse(d.trim());process.stdout.write(JSON.stringify(Array.isArray(a)?a:[]))}catch{process.stdout.write('[]')}})" <<<"$1"
+        }
+        APPS=$(clean_json "$APPS")
+        LIBS=$(clean_json "$LIBS")
+        ALL=$(clean_json "$ALL")
+
+        COUNT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).length))" "$ALL")
+        HAS="false"
+        [ "$COUNT" -gt 0 ] && HAS="true"
+
+        echo "all=$ALL"   >> "$GITHUB_OUTPUT"
+        echo "apps=$APPS" >> "$GITHUB_OUTPUT"
+        echo "libs=$LIBS" >> "$GITHUB_OUTPUT"
+        echo "has-affected=$HAS" >> "$GITHUB_OUTPUT"
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+        echo ""
+        echo "─── Nx Affected ───"
+        echo "Base:  $BASE"
+        echo "Head:  $HEAD"
+        [ -n "$TARGET" ] && echo "Target: $TARGET (filter: --with-target)"
+        echo "Apps:  $APPS"
+        echo "Libs:  $LIBS"
+        echo "Count: $COUNT"
+        echo "──────────────────"

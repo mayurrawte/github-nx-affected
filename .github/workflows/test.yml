@@ -1,0 +1,205 @@
+name: Test Action
+
+on:
+  push:
+    branches: [master, main, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  # Smoke test: the test fixture has no real lockfile, so we test against a
+  # commit range we craft inside the job — change a file in app-a, ensure
+  # only app-a (and any dependents) shows up as affected.
+  test-affected-app:
+    name: Test — affected app only (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Initialize Nx test workspace
+        shell: bash
+        working-directory: .github/test-fixtures/nx-workspace
+        run: |
+          # Generate a lockfile so setup-node caching works
+          npm install --package-lock-only
+
+          # Initialize a fresh git repo inside the fixture so nx affected has
+          # a clean commit range to diff. This is isolated from the outer repo.
+          git init -b main
+          git config user.email "test@example.com"
+          git config user.name "Test"
+          git add -A
+          git commit -m "initial"
+          BASE_SHA=$(git rev-parse HEAD)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+
+          # Modify app-a, commit. lib-shared and app-b untouched.
+          echo "export const APP_A_V2 = true;" >> apps/app-a/src/index.ts
+          git add -A
+          git commit -m "change app-a"
+
+      - name: Run nx-affected action
+        id: nx
+        uses: ./
+        with:
+          working-directory: .github/test-fixtures/nx-workspace
+          base: ${{ env.BASE_SHA }}
+          head: HEAD
+
+      - name: Verify only app-a is affected
+        shell: bash
+        run: |
+          APPS='${{ steps.nx.outputs.affected-apps }}'
+          HAS='${{ steps.nx.outputs.has-affected }}'
+          COUNT='${{ steps.nx.outputs.count }}'
+          echo "Apps:  $APPS"
+          echo "Has:   $HAS"
+          echo "Count: $COUNT"
+
+          if [ "$HAS" != "true" ]; then
+            echo "ERROR: expected has-affected=true, got $HAS"; exit 1
+          fi
+
+          # Expect exactly ["app-a"] for the apps output.
+          EXPECTED='["app-a"]'
+          if [ "$APPS" != "$EXPECTED" ]; then
+            echo "ERROR: expected apps=$EXPECTED, got $APPS"; exit 1
+          fi
+
+  # When no source files change between base and head, nothing should be affected.
+  test-no-affected:
+    name: Test — no affected (nothing changed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Initialize Nx test workspace with empty diff
+        shell: bash
+        working-directory: .github/test-fixtures/nx-workspace
+        run: |
+          npm install --package-lock-only
+          git init -b main
+          git config user.email "test@example.com"
+          git config user.name "Test"
+          git add -A
+          git commit -m "initial"
+          # Empty commit — no source file changes
+          git commit --allow-empty -m "no-op"
+          echo "BASE_SHA=$(git rev-parse HEAD~1)" >> "$GITHUB_ENV"
+
+      - name: Run nx-affected action
+        id: nx
+        uses: ./
+        with:
+          working-directory: .github/test-fixtures/nx-workspace
+          base: ${{ env.BASE_SHA }}
+          head: HEAD
+
+      - name: Verify nothing is affected
+        shell: bash
+        run: |
+          HAS='${{ steps.nx.outputs.has-affected }}'
+          COUNT='${{ steps.nx.outputs.count }}'
+          APPS='${{ steps.nx.outputs.affected-apps }}'
+          echo "Has: $HAS, Count: $COUNT, Apps: $APPS"
+          if [ "$HAS" != "false" ]; then
+            echo "ERROR: expected has-affected=false, got $HAS"; exit 1
+          fi
+          if [ "$APPS" != "[]" ]; then
+            echo "ERROR: expected apps=[], got $APPS"; exit 1
+          fi
+
+  # When lib-shared changes and is depended on by both apps, both should be affected.
+  # (Note: our fixture has no implicit deps between apps and the lib, so a real
+  # dependency test would require adding implicitDependencies or import graph.
+  # This test verifies the lib itself is detected.)
+  test-affected-lib:
+    name: Test — affected lib detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Initialize Nx test workspace
+        shell: bash
+        working-directory: .github/test-fixtures/nx-workspace
+        run: |
+          npm install --package-lock-only
+          git init -b main
+          git config user.email "test@example.com"
+          git config user.name "Test"
+          git add -A
+          git commit -m "initial"
+          BASE_SHA=$(git rev-parse HEAD)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+
+          echo "export const SHARED_V2 = true;" >> libs/lib-shared/src/index.ts
+          git add -A
+          git commit -m "change lib-shared"
+
+      - name: Run nx-affected action
+        id: nx
+        uses: ./
+        with:
+          working-directory: .github/test-fixtures/nx-workspace
+          base: ${{ env.BASE_SHA }}
+          head: HEAD
+
+      - name: Verify lib-shared is in affected-libs
+        shell: bash
+        run: |
+          LIBS='${{ steps.nx.outputs.affected-libs }}'
+          echo "Libs: $LIBS"
+          if [ "$LIBS" != '["lib-shared"]' ]; then
+            echo "ERROR: expected libs=[\"lib-shared\"], got $LIBS"; exit 1
+          fi
+
+  # Target filtering: app-a has 'deploy' target, app-b doesn't.
+  # Changing both, filtered by --with-target=deploy, should return only app-a.
+  test-target-filter:
+    name: Test — target filter (--with-target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Initialize workspace with both apps changed
+        shell: bash
+        working-directory: .github/test-fixtures/nx-workspace
+        run: |
+          npm install --package-lock-only
+          git init -b main
+          git config user.email "test@example.com"
+          git config user.name "Test"
+          git add -A
+          git commit -m "initial"
+          BASE_SHA=$(git rev-parse HEAD)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+
+          echo "// changed" >> apps/app-a/src/index.ts
+          echo "// changed" >> apps/app-b/src/index.ts
+          git add -A
+          git commit -m "change both apps"
+
+      - name: Run with target=deploy filter
+        id: nx
+        uses: ./
+        with:
+          working-directory: .github/test-fixtures/nx-workspace
+          base: ${{ env.BASE_SHA }}
+          head: HEAD
+          target: deploy
+
+      - name: Verify only app-a (the one with deploy target) is returned
+        shell: bash
+        run: |
+          APPS='${{ steps.nx.outputs.affected-apps }}'
+          echo "Apps with deploy target: $APPS"
+          if [ "$APPS" != '["app-a"]' ]; then
+            echo "ERROR: expected apps=[\"app-a\"], got $APPS"; exit 1
+          fi
