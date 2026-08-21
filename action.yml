@@ -1,4 +1,4 @@
-name: 'Nx Affected Matrix'
+name: 'Nx Affected Projects'
 description: 'Detect affected Nx projects in monorepos and output matrix-ready JSON arrays for fan-out builds, tests, and deploys.'
 author: 'Mayur Rawte'
 branding:
